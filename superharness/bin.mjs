@@ -94,7 +94,7 @@ function makeEvents(root) {
           : C.bad(`  ✗ ${ev.call.id} ${ev.result.error ?? "failed"}`));
         break;
       case "protocol-warn": console.log(C.warn(`  ! protocol drift: ${ev.errors.join("; ")}`)); break;
-      case "still-waiting": console.log(C.dim(`  … agent still thinking (wait ${ev.attempt}/${ev.max}) — send "continue" in the thread if stuck`)); break;
+      case "waiting": console.log(C.dim(`  … waiting for agent (${Math.round(ev.elapsedMs / 1000)}s) — send "continue" in the thread to nudge it`)); break;
       case "adopted": console.log(C.warn(`  ⤷ adopted the agent's reply to your manual message`)); break;
       case "done": console.log(C.ok(`\n✔ DONE in ${ev.rounds} rounds: `) + ev.summary); break;
       case "error": console.log(C.bad(`\n✗ failed after ${ev.rounds} rounds: ${ev.error}`)); break;

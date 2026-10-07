@@ -83,6 +83,9 @@ const NUDGE = `⟦NUDGE⟧ Your last reply did not follow the protocol. Real-mac
 // ------------------------------------------------------------------ AgentLoop
 
 export class AgentLoop {
+  /** assistant reply ids already consumed this task (never adopt/consume twice) */
+  #seenReplyIds = new Set();
+
   /**
    * @param client   SuperAppClient (from ../superapp.mjs)
    * @param opts     { root, channelId, model, maxRounds, timeoutMs, sessionsDir,
@@ -100,6 +103,7 @@ export class AgentLoop {
     this.onEvent = opts.onEvent ?? (() => {});
     this.shouldInterrupt = opts.shouldInterrupt ?? (() => false);
     this.preambleSent = false;
+    this.#seenReplyIds = new Set(); // assistant replies already consumed (never adopt twice)
   }
 
   #sessionFile() {
@@ -119,15 +123,12 @@ export class AgentLoop {
     });
   }
 
-  #waitReply(threadRootId) {
-    return this.client.waitForReply(this.channelId, threadRootId, { timeoutMs: REPLY_TIMEOUT_MS });
-  }
-
   /**
    * Run a task to completion. Returns { ok, summary, rounds, interrupted }.
    */
   async run(task, { preamble = true, resumeSessionId = null } = {}) {
     this.sessionId = resumeSessionId ?? `sh-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    this.#seenReplyIds = new Set(); // never adopt/consume the same assistant reply twice
     const deadline = Date.now() + this.timeoutMs;
     let rounds = 0;
 
@@ -137,6 +138,7 @@ export class AgentLoop {
     this.onEvent({ type: "task-start", task, sessionId: this.sessionId, model: this.model, effort: this.reasoningEffort });
     await this.#log({ type: "meta", sessionId: this.sessionId, root: this.root, channelId: this.channelId, model: this.model, task, resumable: true });
     let { threadRootId } = await this.#post(firstMsg);
+    let postedAt = Date.now();
 
     try {
       while (rounds < this.maxRounds) {
@@ -148,7 +150,12 @@ export class AgentLoop {
         }
         rounds++;
         this.onEvent({ type: "round-start", round: rounds });
-        const reply = await this.#waitRound(threadRootId);
+        const reply = await this.#waitRound(threadRootId, postedAt);
+        if (reply.interrupted) {
+          await this.#post("⟦INTERRUPTED⟧ {\"reason\":\"new human message arrived\"}");
+          await this.#log({ type: "interrupted", round: rounds });
+          return { ok: false, interrupted: true, summary: "interrupted by human message", rounds };
+        }
         await this.#log({ type: "reply", round: rounds, text: reply.text });
 
         const parsed = parseReply(reply.text);
@@ -161,6 +168,7 @@ export class AgentLoop {
           if (parsed.errors.length) this.onEvent({ type: "protocol-warn", errors: parsed.errors });
           const ping = await this.#post(NUDGE);
           threadRootId = ping.threadRootId;
+          postedAt = Date.now();
           continue;
         }
 
@@ -181,6 +189,7 @@ export class AgentLoop {
         // sandbox_upload view:true → attach those images so the model SEES them next round
         const viewFilePaths = results.flatMap((r) => (Array.isArray(r.view_file_paths) ? r.view_file_paths : []));
         ({ threadRootId } = await this.#post(msg, { viewFilePaths }));
+        postedAt = Date.now();
       }
       throw new Error(`max rounds (${this.maxRounds}) exhausted without ⟦DONE⟧`);
     } catch (e) {
@@ -191,53 +200,80 @@ export class AgentLoop {
   }
 
   /**
-   * Wait for the reply to our message — SILENTLY. No pings, no nudges on stall:
-   * every automatic message re-wakes the agent and floods the thread. If the
-   * human sends a manual "continue" in the thread meanwhile, the agent answers
-   * THAT message — the adoption scan picks it up and executes its tools.
-   * After MAX_WAITS_PER_ROUND passive cycles, fail with guidance (nothing lost).
+   * Wait for the reply to our message — SILENTLY (no pings: they re-wake the
+   * agent and flood the thread). On EVERY poll (~3s) we check both:
+   *   1. the expected reply (thread_root_id === ours), completed or failed;
+   *   2. an ORPHAN reply — the agent answered a human message typed meanwhile
+   *      (e.g. a manual "continue") — and adopt it immediately.
+   * Adoption is time-based (created_at > our post time), not window-based, so
+   * long threads can't break it. Heartbeat events keep the console alive.
    */
-  async #waitRound(threadRootId) {
-    for (let attempt = 1; ; attempt++) {
-      try {
-        return await this.#waitReply(threadRootId);
-      } catch (e) {
-        if (!/timed out/i.test(e.message)) throw e;
-        const adopted = await this.#adoptOrphanReply(threadRootId);
-        if (adopted) return adopted;
-        if (attempt >= MAX_WAITS_PER_ROUND) {
-          throw new Error(
-            `no agent reply after ${attempt * (REPLY_TIMEOUT_MS / 60000)} min of waiting. ` +
-            `The thread is intact — send "continue" in the thread (watch mode will adopt it) ` +
-            `or re-run: exec --channel ${this.channelId}`,
-          );
-        }
-        this.onEvent({ type: "still-waiting", attempt, max: MAX_WAITS_PER_ROUND });
-      }
-    }
-  }
+  async #waitRound(threadRootId, postedAtMs) {
+    const maxMs = REPLY_TIMEOUT_MS * MAX_WAITS_PER_ROUND;
+    const start = Date.now();
+    let lastBeat = start;
+    let pollErrors = 0;
 
-  /**
-   * Look for a completed assistant reply rooted at a DIFFERENT message (i.e., the
-   * human interrupted and the agent answered them) created after our message.
-   * Returns { text } for the newest such reply, or null.
-   */
-  async #adoptOrphanReply(expectedRoot) {
-    const msgs = await this.client.history(this.channelId, { limit: 50 });
-    const ours = msgs.find((m) => m.id === expectedRoot);
-    if (!ours?.created_at) return null;
-    for (const m of msgs) {
-      if (m.role !== "assistant" || m.thread_root_id === expectedRoot) continue;
-      if (!m.created_at || m.created_at < ours.created_at) continue;
-      const state = m.agent_session?.state;
-      if (state && state !== "completed") continue;
-      const text = SuperAppClient.answerText(m);
-      if (!text.trim()) continue;
-      this.onEvent({ type: "adopted", threadRootId: m.thread_root_id });
-      await this.#log({ type: "adopted", expectedRoot, adoptedRoot: m.thread_root_id, text: text.slice(0, 4000) });
-      return { text };
+    for (;;) {
+      if (this.shouldInterrupt()) return { interrupted: true };
+
+      let msgs = [];
+      try {
+        msgs = await this.client.history(this.channelId, { limit: 60 });
+        pollErrors = 0;
+      } catch (e) {
+        if (++pollErrors > 10) throw new Error(`history polling failed repeatedly: ${e.message}`);
+        await new Promise((r) => setTimeout(r, 3000));
+        continue;
+      }
+
+      // 1) the reply we're waiting for
+      const reply = msgs.find(
+        (m) => m.role === "assistant" && m.thread_root_id === threadRootId && !this.#seenReplyIds.has(m.id),
+      );
+      if (reply) {
+        const state = reply.agent_session?.state;
+        if (state === "failed") throw new Error(`agent session failed for thread ${threadRootId}`);
+        if (!state || state === "completed") {
+          this.#seenReplyIds.add(reply.id);
+          return { text: SuperAppClient.answerText(reply) };
+        }
+        // still running → fall through to orphan scan + keep waiting
+      }
+
+      // 2) orphan adoption: agent answered a different (human) message posted after ours
+      const orphan = msgs.find((m) =>
+        m.role === "assistant"
+        && m.thread_root_id !== threadRootId
+        && !this.#seenReplyIds.has(m.id)
+        && m.created_at
+        && Date.parse(m.created_at) >= postedAtMs - 60_000 // clock-skew tolerance
+        && (!m.agent_session || m.agent_session.state === "completed"),
+      );
+      if (orphan) {
+        this.#seenReplyIds.add(orphan.id);
+        const text = SuperAppClient.answerText(orphan);
+        if (text.trim()) {
+          this.onEvent({ type: "adopted", threadRootId: orphan.thread_root_id });
+          await this.#log({ type: "adopted", expectedRoot: threadRootId, adoptedRoot: orphan.thread_root_id, text: text.slice(0, 4000) });
+          return { text };
+        }
+      }
+
+      const elapsed = Date.now() - start;
+      if (elapsed > maxMs) {
+        throw new Error(
+          `no agent reply after ${Math.round(maxMs / 60000)} min. The thread is intact — ` +
+          `send "continue" in the thread (a running watch adopts it instantly; a fresh exec adopts it too) ` +
+          `or re-run: exec --channel ${this.channelId}`,
+        );
+      }
+      if (Date.now() - lastBeat >= 30_000) {
+        lastBeat = Date.now();
+        this.onEvent({ type: "waiting", elapsedMs: elapsed });
+      }
+      await new Promise((r) => setTimeout(r, 3000));
     }
-    return null;
   }
 }
 
