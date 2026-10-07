@@ -1,0 +1,12 @@
+# Credentials and sessions
+cookies.json
+cookies.token.json
+.superharness/
+.env
+
+# Dependencies
+node_modules/
+
+# OS / logs
+*.log
+.DS_Store
