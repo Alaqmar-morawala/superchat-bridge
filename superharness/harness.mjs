@@ -14,7 +14,7 @@ import { MAX_TOOL_CALLS_PER_ROUND } from "./safety.mjs";
 
 const HARNESS_SIG = "⟦HARNESS v1⟧";
 const REPLY_TIMEOUT_MS = 4 * 60_000; // per-wait window; pings + adoption handle stalls
-const MAX_WAITS_PER_ROUND = 3; // strict wait + 2 ping/adopt retries before failing
+const DEFAULT_MAX_WAITS_PER_ROUND = 8; // 8 x 4-min waits ~= 32 min per round; sol@max can think long
 // transcripts live centrally next to the package, not inside agent workspaces
 const CENTRAL_SESSIONS_DIR = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)), "..", ".superharness", "sessions",
@@ -88,8 +88,8 @@ export class AgentLoop {
 
   /**
    * @param client   SuperAppClient (from ../superapp.mjs)
-   * @param opts     { root, channelId, model, maxRounds, timeoutMs, sessionsDir,
-   *                   onEvent, shouldInterrupt }
+   * @param opts     { root, channelId, model, maxRounds, timeoutMs, maxWaitsPerRound,
+   *                   sessionsDir, onEvent, shouldInterrupt }
    */
   constructor(client, opts) {
     this.client = client;
@@ -99,6 +99,7 @@ export class AgentLoop {
     this.reasoningEffort = opts.reasoningEffort ?? "adaptive"; // adaptive|low|medium|high|xhigh|max
     this.maxRounds = opts.maxRounds ?? 40;
     this.timeoutMs = opts.timeoutMs ?? 45 * 60_000;
+    this.maxWaitsPerRound = opts.maxWaitsPerRound ?? DEFAULT_MAX_WAITS_PER_ROUND;
     this.sessionsDir = opts.sessionsDir ?? CENTRAL_SESSIONS_DIR;
     this.onEvent = opts.onEvent ?? (() => {});
     this.shouldInterrupt = opts.shouldInterrupt ?? (() => false);
@@ -209,7 +210,7 @@ export class AgentLoop {
    * long threads can't break it. Heartbeat events keep the console alive.
    */
   async #waitRound(threadRootId, postedAtMs) {
-    const maxMs = REPLY_TIMEOUT_MS * MAX_WAITS_PER_ROUND;
+    const maxMs = REPLY_TIMEOUT_MS * this.maxWaitsPerRound;
     const start = Date.now();
     let lastBeat = start;
     let pollErrors = 0;

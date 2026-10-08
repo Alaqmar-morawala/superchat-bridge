@@ -66,6 +66,7 @@ Options:
   --backlog                             watch: also process tasks typed before startup
   --max-rounds N                        default 40
   --timeout-mins M                      default 45
+  --max-waits N                         default 8 (8 x 4-min waits ~= 32 min per round)
 `);
 }
 
@@ -221,6 +222,7 @@ async function cmdExec({ positional, flags }) {
     reasoningEffort: flags.effort ?? "adaptive",
     maxRounds: Number(flags["max-rounds"]) || 40,
     timeoutMs: (Number(flags["timeout-mins"]) || 45) * 60_000,
+    maxWaitsPerRound: Number(flags["max-waits"]) || 8,
     onEvent: makeEvents(root),
   });
   try {
@@ -323,6 +325,7 @@ async function cmdWatch({ flags }) {
           reasoningEffort: effort,
           maxRounds: Number(flags["max-rounds"]) || 40,
           timeoutMs: (Number(flags["timeout-mins"]) || 45) * 60_000,
+          maxWaitsPerRound: Number(flags["max-waits"]) || 8,
           onEvent: makeEvents(root),
           shouldInterrupt,
         });
@@ -400,6 +403,20 @@ async function cmdDoctor() {
   for (const d of dirs) { fs.mkdirSync(d, { recursive: true }); console.log(C.ok("✓ sessions dir:"), d); }
   client.closeGateway();
 }
+
+// ------------------------------------------------------------- signal resilience
+// The harness is usually launched over SSH (bore / cloudflared tunnels). When the
+// tunnel flaps, the remote shell exits and the kernel delivers SIGHUP — which by
+// default kills a foreground node process silently mid-round (observed 2026-10-08).
+// Ignore SIGHUP so the agent loop survives transient SSH drops; progress is
+// checkpointed to the session transcript regardless.
+// For full immunity (survives even a dead SSH session), launch detached:
+//   setsid nohup node bin.mjs exec "..." --root DIR --model sol --effort max \
+//     < /dev/null > /tmp/harness-<id>.log 2>&1 & disown
+// (Ctrl-C still works: it sends SIGINT, not SIGHUP.)
+process.on('SIGHUP', () => {
+  console.error(C.warn("\n[SIGHUP] tunnel/ssh dropped — ignoring, agent loop continues"));
+});
 
 // ------------------------------------------------------------- main
 

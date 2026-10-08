@@ -32,6 +32,19 @@ node bin.mjs sessions             # every run is transcribed to .superharness/se
 node bin.mjs watch --new --root ~/myrepo   # bridge: type tasks in SuperApp's UI
 ```
 
+## Long-running / detached
+
+The harness is usually launched over SSH (bore / cloudflared tunnels). If the
+tunnel flaps, the remote shell exits and the kernel sends SIGHUP — bin.mjs
+ignores SIGHUP so the loop survives, but for full immunity launch detached:
+
+    setsid nohup node bin.mjs exec "task" --root DIR --model sol --effort max \
+      < /dev/null > /tmp/harness-<id>.log 2>&1 & disown
+
+Then follow progress with `tail -f /tmp/harness-<id>.log`. Every round is
+checkpointed to `.superharness/sessions/<id>.jsonl`, so a killed run can always
+be resumed with `node bin.mjs exec --resume` (or `--channel <id>`).
+
 ## The two frontends
 
 **`exec`** — one-shot agent run. Creates a *fresh, isolated SuperApp thread* per run
@@ -103,7 +116,7 @@ built-in sandbox — that failure mode was observed and is explicitly countered)
 
 **Stall handling is silent by design.** If the agent takes long (max-effort
 thinking), the harness never sends pings — every automatic message re-wakes the
-agent and floods the thread. It just keeps waiting (up to ~12 min per round) and
+agent and floods the thread. It just keeps waiting (up to ~32 min per round by default; tune with --max-waits N) and
 scans for an adopted reply: if a human sends "continue" in the thread meanwhile,
 the agent answers that message and the harness adopts it and executes its tools.
 If truly nothing arrives, the task fails with guidance; the thread is intact and
