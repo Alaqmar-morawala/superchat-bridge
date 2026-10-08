@@ -25,6 +25,19 @@ const WS_GATEWAY = "wss://superapp.chat/ws/v1/gateway/";
 // the server validates Origin on auth endpoints (403 invalid_request_origin_or_shape)
 const ORIGIN_HEADERS = { Origin: BASE, Referer: `${BASE}/h` };
 
+// load .env from the package root (SUPERAPP_EMAIL / SUPERAPP_PASSWORD) — enables
+// auto-relogin when the session cookie is rotated away by the browser app
+try {
+  const fs = await import("node:fs");
+  const envPath = new URL("./.env", import.meta.url);
+  if (fs.existsSync(envPath)) {
+    for (const line of fs.readFileSync(envPath, "utf8").split("\n")) {
+      const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*"?([^"\n]*)"?\s*$/);
+      if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2];
+    }
+  }
+} catch { /* .env is optional */ }
+
 const DEFAULT_WORKSPACE_ID = "db3ba81d-20d9-4818-985c-8c6e1b9e6dde"; // "My Workspace"
 const DEFAULT_TIMEZONE = "Asia/Calcutta";
 

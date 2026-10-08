@@ -74,7 +74,91 @@ async function loadClient() {
     console.error(C.bad("cookies.json not found — run: node capture_session.mjs"));
     process.exit(1);
   }
-  return SuperAppClient.fromCookieFile(COOKIE_FILE);
+  const client = await SuperAppClient.fromCookieFile(COOKIE_FILE);
+  try {
+    await client.token();
+  } catch (e) {
+    if (/session_rejected|invalid_session|Authentication required/i.test(e.message)) {
+      if (process.env.SUPERAPP_EMAIL && process.env.SUPERAPP_PASSWORD) {
+        console.log(C.warn("Session expired. Auto-logging in via capture_session.mjs..."));
+        const { spawnSync } = await import("node:child_process");
+        const res = spawnSync("node", ["capture_session.mjs"], { cwd: AUTO_DIR, stdio: "inherit" });
+        if (res.status === 0) {
+          console.log(C.ok("Auto-relogin succeeded! Loading fresh session..."));
+          return SuperAppClient.fromCookieFile(COOKIE_FILE);
+        }
+      }
+      console.error(C.bad(`\nAuth session expired (${e.message.split("\n")[0]}).`));
+      console.error(C.bad("→ If your browser is open: copy __Host-sa-account-0 cookie value, or run: node ../capture_session.mjs"));
+      process.exit(1);
+    }
+    throw e;
+  }
+  return client;
+}
+
+function resolveChannelId(input) {
+  if (!input) return null;
+  input = String(input).trim();
+  const sessionsDir = path.join(AUTO_DIR, ".superharness", "sessions");
+
+  // "last" keyword -> pick the latest session
+  if (input === "last") {
+    let files = [];
+    try { files = fs.readdirSync(sessionsDir).filter((f) => f.endsWith(".jsonl")); } catch {}
+    if (!files.length) throw new Error("No previous sessions found to resume from.");
+    files.sort((a, b) => {
+      try {
+        return fs.statSync(path.join(sessionsDir, b)).mtimeMs - fs.statSync(path.join(sessionsDir, a)).mtimeMs;
+      } catch { return 0; }
+    });
+    for (const f of files) {
+      try {
+        const firstLine = fs.readFileSync(path.join(sessionsDir, f), "utf8").split("\n")[0];
+        const meta = JSON.parse(firstLine);
+        if (meta.channelId) {
+          const res = resolveChannelId(meta.channelId);
+          if (res) {
+            console.log(C.dim(`  resolved "last" -> session ${meta.sessionId} [thread ${res}]`));
+            return res;
+          }
+        }
+      } catch {}
+    }
+    throw new Error("Could not find a valid channel in previous sessions.");
+  }
+
+  // 1. Thread URL: https://superapp.chat/h/<uuid>
+  const urlM = input.match(/\/h\/([0-9a-f-]{36})/i);
+  if (urlM) return urlM[1];
+
+  // 2. Direct UUID
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(input)) {
+    return input;
+  }
+
+  // 3. Session ID (e.g. sh-1791434269409-t1tua)
+  const sessId = input.replace(/\.jsonl$/, "");
+  const sessFile = path.join(sessionsDir, `${sessId}.jsonl`);
+  if (fs.existsSync(sessFile)) {
+    try {
+      const firstLine = fs.readFileSync(sessFile, "utf8").split("\n")[0];
+      const meta = JSON.parse(firstLine);
+      if (meta.channelId) {
+        const resolved = resolveChannelId(meta.channelId);
+        if (resolved) {
+          console.log(C.dim(`  resolved session ${sessId} -> thread ${resolved}`));
+          return resolved;
+        }
+      }
+    } catch {}
+  }
+
+  if (input.startsWith("sh-")) {
+    throw new Error(`Session ID "${input}" not found in ${sessionsDir}. Run 'node bin.mjs sessions' to see valid sessions.`);
+  }
+
+  throw new Error(`Invalid channel or session ID: "${input}". Provide a thread UUID, a thread URL, or a session ID (sh-...).`);
 }
 
 // ------------------------------------------------------------- renderer
@@ -119,7 +203,8 @@ async function cmdExec({ positional, flags }) {
   const root = path.resolve(flags.root ?? process.cwd());
   const client = await loadClient();
 
-  let channelId = flags.channel ?? null;
+  const rawTarget = flags.channel ?? flags.session ?? (flags.resume ? "last" : null);
+  let channelId = resolveChannelId(rawTarget);
   const continuing = Boolean(channelId); // old thread already has the protocol in memory
   if (!channelId) {
     // fresh isolated thread per run (clean AI context, watchable in the UI)
@@ -155,13 +240,14 @@ async function cmdWatch({ flags }) {
   const model = MODEL_PRESETS[flags.model] ?? flags.model ?? MODEL_PRESETS[DEFAULT_MODEL];
   const client = await loadClient();
 
-  let channelId = flags.channel ?? null;
+  const rawTarget = flags.channel ?? flags.session ?? (flags.resume ? "last" : null);
+  let channelId = resolveChannelId(rawTarget);
   if (!channelId && flags.new) {
     channelId = await client.createChannel(`SuperHarness bridge ${new Date().toISOString().slice(0, 16)}`);
     console.log(C.ok(`created bridge thread: https://superapp.chat/h/${channelId}`));
   }
   if (!channelId) {
-    console.error(C.bad("watch needs --channel <threadId> (or --new to create one); open the thread in SuperApp and type tasks there"));
+    console.error(C.bad("watch needs --channel <threadId|sessionId> (or --resume / --new); open the thread in SuperApp and type tasks there"));
     process.exit(1);
   }
   const effort = flags.effort ?? "adaptive";
@@ -285,8 +371,10 @@ async function cmdSessions({ positional }) {
   }
   const sessions = await listSessions(sessionsDir);
   if (!sessions.length) { console.log(C.dim("no sessions yet")); return; }
+  console.log(C.dim("Sessions (pass session ID or thread ID to --channel or use --resume):\n"));
   for (const s of sessions) {
-    console.log(`${C.hi(s.sessionId)}  ${C.dim(s.ts)}  ${s.model}  ${C.dim((s.task ?? "").slice(0, 80))}`);
+    const threadPart = s.channelId ? C.dim(`[thread ${s.channelId.slice(0, 8)}…]`) : "";
+    console.log(`${C.hi(s.sessionId)}  ${threadPart.padEnd(20)}  ${C.dim(s.ts ? s.ts.slice(0, 16) : "")}  ${s.model?.split("/").pop()}  ${C.dim((s.task ?? "").slice(0, 60))}`);
   }
 }
 
