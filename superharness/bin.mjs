@@ -198,7 +198,40 @@ function summarizeArgs(call) {
 
 // ------------------------------------------------------------- commands
 
+const LOCK_FILE = path.join(AUTO_DIR, ".superharness", "superharness.pid");
+
+function acquireLock(force = false) {
+  fs.mkdirSync(path.dirname(LOCK_FILE), { recursive: true });
+  if (fs.existsSync(LOCK_FILE)) {
+    try {
+      const pid = Number(fs.readFileSync(LOCK_FILE, "utf8").trim());
+      if (pid && pid !== process.pid && !force) {
+        process.kill(pid, 0); // Throws ESRCH if process is dead
+        console.error(C.bad(`\n[Account Protection] Another SuperHarness process (PID ${pid}) is already running!`));
+        console.error(C.bad(`Running multiple concurrent instances creates session conflicts and rapid requests that trigger account bans.`));
+        console.error(C.dim(`To stop the other process: kill ${pid}\nTo override: rm ${LOCK_FILE}\n`));
+        process.exit(1);
+      }
+    } catch (e) {
+      // Process is dead, stale lockfile -> safe to take over
+    }
+  }
+  fs.writeFileSync(LOCK_FILE, String(process.pid));
+  const cleanup = () => {
+    try {
+      if (fs.existsSync(LOCK_FILE)) {
+        const p = Number(fs.readFileSync(LOCK_FILE, "utf8").trim());
+        if (p === process.pid) fs.unlinkSync(LOCK_FILE);
+      }
+    } catch {}
+  };
+  process.on("exit", cleanup);
+  process.on("SIGINT", () => { cleanup(); process.exit(0); });
+  process.on("SIGTERM", () => { cleanup(); process.exit(0); });
+}
+
 async function cmdExec({ positional, flags }) {
+  acquireLock(Boolean(flags["force-lock"]));
   const task = positional.filter((p) => !p.startsWith("-")).join(" ");
   if (!task) { usage(); process.exit(1); }
   const root = path.resolve(flags.root ?? process.cwd());
@@ -238,6 +271,7 @@ async function cmdExec({ positional, flags }) {
 }
 
 async function cmdWatch({ flags }) {
+  acquireLock(Boolean(flags["force-lock"]));
   const root = path.resolve(flags.root ?? process.cwd());
   const model = MODEL_PRESETS[flags.model] ?? flags.model ?? MODEL_PRESETS[DEFAULT_MODEL];
   const client = await loadClient();
@@ -352,7 +386,8 @@ async function cmdWatch({ flags }) {
       }
       console.error(C.bad(`poll error: ${e.message}`));
     }
-    await new Promise((r) => setTimeout(r, 2500));
+    // Jittered natural polling (4.5s - 7.0s) prevents machine-like constant polling signatures
+    await new Promise((r) => setTimeout(r, 4500 + Math.floor(Math.random() * 2500)));
   }
 }
 

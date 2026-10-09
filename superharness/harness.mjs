@@ -189,6 +189,9 @@ export class AgentLoop {
         const msg = formatResults(results, { round: rounds, maxRounds: this.maxRounds });
         // sandbox_upload view:true → attach those images so the model SEES them next round
         const viewFilePaths = results.flatMap((r) => (Array.isArray(r.view_file_paths) ? r.view_file_paths : []));
+        // Cadence pacing: small randomized pause (400-800ms) prevents sub-millisecond
+        // machine-gun bursts over the WebSocket that trigger rate-limiters
+        await new Promise((r) => setTimeout(r, 400 + Math.floor(Math.random() * 400)));
         ({ threadRootId } = await this.#post(msg, { viewFilePaths }));
         postedAt = Date.now();
       }
@@ -223,8 +226,10 @@ export class AgentLoop {
         msgs = await this.client.history(this.channelId, { limit: 60 });
         pollErrors = 0;
       } catch (e) {
-        if (++pollErrors > 10) throw new Error(`history polling failed repeatedly: ${e.message}`);
-        await new Promise((r) => setTimeout(r, 3000));
+        pollErrors++;
+        if (pollErrors > 10) throw new Error(`history polling failed repeatedly: ${e.message}`);
+        const errWait = Math.min(30000, 3000 * Math.pow(1.5, pollErrors));
+        await new Promise((r) => setTimeout(r, errWait));
         continue;
       }
 
@@ -273,7 +278,11 @@ export class AgentLoop {
         lastBeat = Date.now();
         this.onEvent({ type: "waiting", elapsedMs: elapsed });
       }
-      await new Promise((r) => setTimeout(r, 3000));
+      // Adaptive interval with randomized jitter (4.5s - 7.0s) prevents fixed-frequency bot polling signatures
+      const pollDelay = elapsed < 15_000
+        ? 5000 + Math.floor(Math.random() * 2000)
+        : 4500 + Math.floor(Math.random() * 2500);
+      await new Promise((r) => setTimeout(r, pollDelay));
     }
   }
 }

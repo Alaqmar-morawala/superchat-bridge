@@ -22,8 +22,20 @@ const BASE = "https://superapp.chat";
 const API = `${BASE}/api/v1`;
 const WS_GATEWAY = "wss://superapp.chat/ws/v1/gateway/";
 
-// the server validates Origin on auth endpoints (403 invalid_request_origin_or_shape)
-const ORIGIN_HEADERS = { Origin: BASE, Referer: `${BASE}/h` };
+// realistic browser headers — prevents Cloudflare / WAF bot flagging
+const BROWSER_HEADERS = {
+  Origin: BASE,
+  Referer: `${BASE}/h`,
+  "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+  "Sec-Ch-Ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+  "Sec-Ch-Ua-Mobile": "?0",
+  "Sec-Ch-Ua-Platform": '"Linux"',
+  "Sec-Fetch-Dest": "empty",
+  "Sec-Fetch-Mode": "cors",
+  "Sec-Fetch-Site": "same-origin",
+  "Accept-Language": "en-US,en;q=0.9",
+};
+const ORIGIN_HEADERS = BROWSER_HEADERS;
 
 // load .env from the package root (SUPERAPP_EMAIL / SUPERAPP_PASSWORD) — enables
 // auto-relogin when the session cookie is rotated away by the browser app
@@ -255,6 +267,12 @@ export class SuperAppClient {
       body: body === undefined ? undefined : isMultipart ? body : JSON.stringify(body),
     });
     this._applySetCookies(res);
+    if (res.status === 429) {
+      const waitSec = Math.max(5, Math.min(60, Number(res.headers.get("retry-after")) || 15));
+      console.warn(`[SuperApp] Rate limited (HTTP 429) on ${path}. Backing off for ${waitSec}s to protect account...`);
+      await new Promise((r) => setTimeout(r, waitSec * 1000));
+      return this.request(method, path, { query, body, retry401, headers: extraHeaders });
+    }
     if (res.status === 401 && retry401) {
       this._token = null;
       this._sessionId = null;
